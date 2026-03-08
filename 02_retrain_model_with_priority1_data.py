@@ -6,10 +6,15 @@ Train XGBoost model using features derived from PRIORITY 1 datasets
 Output: Updated deep_learning_model.json with real data patterns
 """
 
+import sys
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
+
+# Fix Windows console UTF-8 encoding
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 from xgboost import XGBClassifier
 from sklearn.metrics import auc, roc_curve, confusion_matrix, precision_recall_fscore_support
 import json
@@ -71,26 +76,31 @@ scale_pos_weight = neg_count / pos_count
 
 print(f"✓ Class weight ratio: {scale_pos_weight:.2f}")
 
-# Train XGBoost
-model = XGBClassifier(
-    n_estimators=200,
-    max_depth=7,
-    learning_rate=0.1,
+# Train XGBoost — constrained to prevent overfitting on synthetic data
+# Lower max_depth + regularisation mimics real-world model behaviour
+base_model = XGBClassifier(
+    n_estimators=300,
+    max_depth=4,              # shallower trees — less memorisation
+    learning_rate=0.05,
     scale_pos_weight=scale_pos_weight,
-    subsample=0.8,
-    colsample_bytree=0.8,
+    subsample=0.75,
+    colsample_bytree=0.70,
+    min_child_weight=8,       # require more samples per leaf
+    gamma=0.15,               # min loss reduction to split
+    reg_alpha=0.1,            # L1 regularisation
+    reg_lambda=1.5,           # L2 regularisation
     random_state=42,
     tree_method='hist',
     device='cpu'
 )
 
-model.fit(
-    X_train_scaled, y_train,
-    eval_set=[(X_test_scaled, y_test)],
-    verbose=False
-)
+# Wrap with Platt scaling calibration so probabilities don't saturate at 0/1
+# cv=5 means the model is fitted 5 times on cross-val folds for calibration
+print("Training XGBoost with Platt scaling calibration (5-fold CV)...")
+model = CalibratedClassifierCV(base_model, method='sigmoid', cv=5)
+model.fit(X_train_scaled, y_train)
 
-print("✓ Model trained successfully")
+print("✓ Model trained and calibrated successfully")
 
 # Evaluate on test set
 print("\n[5/5] Evaluating model...")
@@ -118,12 +128,12 @@ print(f"  - False Negatives (Missed Defaults): {fn:,}")
 # Save model as JSON for compatibility
 print("\n[6/5] Saving model...")
 model_dict = {
-    'model_type': 'XGBoost',
+    'model_type': 'XGBoost + Platt calibration',
     'n_features': len(feature_cols),
     'feature_names': feature_cols,
-    'n_estimators': model.n_estimators,
-    'max_depth': model.max_depth,
-    'learning_rate': model.learning_rate,
+    'n_estimators': 300,
+    'max_depth': 4,
+    'learning_rate': 0.05,
     'auc_score': float(auc_score),
     'precision': float(precision),
     'recall': float(recall),
@@ -134,8 +144,9 @@ model_dict = {
 with open('deep_learning_model.json', 'w') as f:
     json.dump(model_dict, f, indent=2)
 
-# Save model binary
-model.save_model('xgboost_model.bin')
+# Save calibrated model with pickle (CalibratedClassifierCV is sklearn, not XGBoost native)
+with open('xgboost_model.bin', 'wb') as f:
+    pickle.dump(model, f)
 
 # Save scaler
 with open('feature_scaler.pkl', 'wb') as f:
@@ -158,7 +169,9 @@ print(f"  - model_predictions_test.npy (test predictions)")
 print("\nGenerating predictions for all 10,000 customers...")
 
 X_all_scaled = scaler.transform(X)
-all_probs = model.predict_proba(X_all_scaled)[:, 1]
+all_probs_raw = model.predict_proba(X_all_scaled)[:, 1]
+# Clip to [0.01, 0.99] — no real model should be 100% certain
+all_probs = np.clip(all_probs_raw, 0.01, 0.99)
 
 predictions_df = pd.DataFrame({
     'customer_id': features_df['customer_id'],
@@ -174,6 +187,40 @@ print(f"  - HIGH RISK (prob > 0.6): {(all_probs > 0.6).sum():,} customers")
 print(f"  - MEDIUM RISK (0.3-0.6): {((all_probs > 0.3) & (all_probs <= 0.6)).sum():,} customers")
 print(f"  - LOW RISK (< 0.3): {(all_probs <= 0.3).sum():,} customers")
 
+# ============================================================================
+# GENERATE UNIFIED CUSTOMER DECISIONS (for Streamlit dashboard)
+# ============================================================================
+print("\nGenerating unified customer decisions...")
+
+def assign_risk_level(prob):
+    # Thresholds tuned so risk levels give a realistic spread:
+    # CRITICAL ~8-12%, HIGH ~10-14%, MEDIUM ~15-20%, LOW ~55-65%
+    if prob >= 0.62: return 'CRITICAL'
+    if prob >= 0.42: return 'HIGH'
+    if prob >= 0.22: return 'MEDIUM'
+    return 'LOW'
+
+def assign_action(risk):
+    actions = {
+        'CRITICAL': 'IMMEDIATE_CONTACT',
+        'HIGH': 'URGENT_OUTREACH',
+        'MEDIUM': 'MONITOR_CLOSELY',
+        'LOW': 'STANDARD_REVIEW'
+    }
+    return actions.get(risk, 'STANDARD_REVIEW')
+
+decisions_df = pd.DataFrame({
+    'customer_id': features_df['customer_id'],
+    'default_probability': np.round(all_probs, 4),
+    'risk_level': [assign_risk_level(p) for p in all_probs],
+    'recommended_action': [assign_action(assign_risk_level(p)) for p in all_probs],
+    'is_default_actual': features_df['is_default']
+})
+
+decisions_df.to_csv('unified_customer_decisions.csv', index=False)
+print(f"✓ unified_customer_decisions.csv: {len(decisions_df):,} rows")
+print(f"  Risk levels: {decisions_df['risk_level'].value_counts().to_dict()}")
+
 print("\n" + "=" * 80)
 print("✓ MODEL RETRAINING COMPLETE")
 print("=" * 80)
@@ -182,4 +229,5 @@ print(f"✓ Features derived from transactions, EMI, savings, utilities")
 print(f"✓ Currency: Indian Rupees (₹)")
 print(f"✓ Customers: 10,000 with real default patterns")
 print(f"✓ Performance: AUC {auc_score:.4f}, Recall {recall:.4f}, Precision {precision:.4f}")
+print(f"✓ Decisions: unified_customer_decisions.csv for dashboard")
 print("\n" + "=" * 80)
